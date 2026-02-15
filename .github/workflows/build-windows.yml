@@ -35,6 +35,7 @@ jobs:
         with:
           submodules: false
           clean: true
+          lfs: true
 
       - name: Cache lib/windows_x64 (LFS)
         id: cache-libs
