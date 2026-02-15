@@ -18,6 +18,9 @@ jobs:
     env:
       BUILD_DIR: ${{ github.workspace }}\build
       BUILD_TYPE: Release
+      CUDA_VERSION: "12.8.1"
+      CUDA_VERSION_SHORT: "12.8"
+      OPTIX_VERSION: "8.1.0"
 
     steps:
       - name: Clean workspace
@@ -48,6 +51,64 @@ jobs:
         shell: pwsh
         run: git submodule update --progress --init release/datafiles/assets
 
+      - name: Install CUDA Toolkit
+        id: install-cuda
+        shell: pwsh
+        run: |
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_SHORT }}"
+          if (Test-Path "$cudaPath\bin\nvcc.exe") {
+            Write-Host "CUDA ${{ env.CUDA_VERSION_SHORT }} already installed at $cudaPath"
+          } else {
+            Write-Host "Downloading CUDA Toolkit ${{ env.CUDA_VERSION }}..."
+            $installerUrl = "https://developer.download.nvidia.com/compute/cuda/${{ env.CUDA_VERSION }}/network_installers/cuda_${{ env.CUDA_VERSION }}_windows_network.exe"
+            $installerPath = "${{ runner.temp }}\cuda_installer.exe"
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+            Write-Host "Installing CUDA Toolkit (silent)..."
+            $proc = Start-Process -FilePath $installerPath -ArgumentList "-s", "nvcc_${{ env.CUDA_VERSION_SHORT }}", "cudart_${{ env.CUDA_VERSION_SHORT }}", "visual_studio_integration_${{ env.CUDA_VERSION_SHORT }}" -Wait -PassThru -NoNewWindow
+            if ($proc.ExitCode -ne 0) { throw "CUDA install failed with exit code $($proc.ExitCode)" }
+            Write-Host "CUDA Toolkit installed successfully"
+          }
+          echo "cuda_path=$cudaPath" >> $env:GITHUB_OUTPUT
+          echo "$cudaPath\bin" >> $env:GITHUB_PATH
+
+      - name: Install OptiX SDK (headers only)
+        id: install-optix
+        shell: pwsh
+        run: |
+          $optixDir = "C:\optix\NVIDIA-OptiX-SDK-${{ env.OPTIX_VERSION }}"
+          if (Test-Path "$optixDir\include\optix.h") {
+            Write-Host "OptiX ${{ env.OPTIX_VERSION }} already installed at $optixDir"
+          } else {
+            Write-Host "Downloading OptiX SDK ${{ env.OPTIX_VERSION }} headers..."
+            # OptiX SDK requires NVIDIA developer login for full download.
+            # As a workaround, we fetch the open-source headers from the official GitHub repo.
+            New-Item -ItemType Directory -Force -Path "$optixDir\include" | Out-Null
+            $baseUrl = "https://raw.githubusercontent.com/NVIDIA/optix-dev/v${{ env.OPTIX_VERSION }}/include"
+            $headers = @(
+              "optix.h", "optix_device.h", "optix_function_table.h",
+              "optix_function_table_definition.h", "optix_host.h",
+              "optix_stack_size.h", "optix_stubs.h", "optix_types.h",
+              "optix_7_device.h", "optix_7_host.h", "optix_7_types.h",
+              "optix_device_impl.h", "optix_device_impl_exception.h",
+              "optix_device_impl_transformations.h"
+            )
+            foreach ($h in $headers) {
+              $url = "$baseUrl/$h"
+              $dest = "$optixDir\include\$h"
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -ErrorAction Stop
+                Write-Host "  Downloaded $h"
+              } catch {
+                Write-Host "  Skipped $h (not in this version)"
+              }
+            }
+            if (-not (Test-Path "$optixDir\include\optix.h")) {
+              throw "Failed to download OptiX headers"
+            }
+            Write-Host "OptiX headers installed successfully"
+          }
+          echo "optix_root=$optixDir" >> $env:GITHUB_OUTPUT
+
       - name: Detect Visual Studio
         id: detect-vs
         shell: pwsh
@@ -57,10 +118,7 @@ jobs:
           if (-not $vsInfo) { throw "Visual Studio not found" }
           $installPath = $vsInfo[0].installationPath
           $version = $vsInfo[0].installationVersion
-          $majorMinor = $version.Split('.')[0..1] -join '.'
           Write-Host "Found VS at: $installPath (version $version)"
-
-          # Determine generator
           if ($version.StartsWith("17")) {
             echo "generator=Visual Studio 17 2022" >> $env:GITHUB_OUTPUT
           } elseif ($version.StartsWith("16")) {
@@ -69,29 +127,6 @@ jobs:
             throw "Unsupported Visual Studio version: $version"
           }
           echo "path=$installPath" >> $env:GITHUB_OUTPUT
-
-      - name: Find OptiX SDK
-        id: find-optix
-        shell: pwsh
-        run: |
-          # Search standard NVIDIA OptiX install locations
-          $searchPaths = @(
-            "$env:ProgramData\NVIDIA Corporation\OptiX SDK 8*",
-            "$env:ProgramData\NVIDIA Corporation\OptiX SDK 7*"
-          )
-          $optixDir = $null
-          foreach ($pattern in $searchPaths) {
-            $found = Get-Item -Path $pattern -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-            if ($found) { $optixDir = $found.FullName; break }
-          }
-          if ($optixDir) {
-            Write-Host "Found OptiX at: $optixDir"
-            echo "optix_root=$optixDir" >> $env:GITHUB_OUTPUT
-            echo "found=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "::warning::OptiX SDK not found — OptiX kernel compilation will be skipped"
-            echo "found=false" >> $env:GITHUB_OUTPUT
-          }
 
       - name: Configure CMake
         shell: cmd
@@ -107,7 +142,7 @@ jobs:
             -DWITH_CYCLES_DEVICE_OPTIX=ON ^
             -DWITH_CYCLES_CUDA_BINARIES=ON ^
             -DWITH_CUDA_DYNLOAD=ON ^
-            ${{ steps.find-optix.outputs.found == 'true' && format('-DOPTIX_ROOT_DIR="{0}"', steps.find-optix.outputs.optix_root) || '' }}
+            -DOPTIX_ROOT_DIR="${{ steps.install-optix.outputs.optix_root }}"
           if errorlevel 1 exit /b 1
 
       - name: Build
