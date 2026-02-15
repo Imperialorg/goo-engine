@@ -1,0 +1,131 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - goo-engine-v4.4-release
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows x64 Release (CUDA + OptiX)
+    runs-on: vms
+    timeout-minutes: 180
+    env:
+      BUILD_DIR: ${{ github.workspace }}\build
+      BUILD_TYPE: Release
+
+    steps:
+      - name: Clean workspace
+        shell: pwsh
+        run: |
+          if (Test-Path "${{ github.workspace }}\*") {
+            Remove-Item -Recurse -Force "${{ github.workspace }}\*"
+          }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          clean: true
+
+      - name: Checkout Windows x64 libraries (with LFS)
+        shell: pwsh
+        run: |
+          git config --local submodule.lib/windows_x64.update checkout
+          $env:GIT_LFS_SKIP_SMUDGE = "1"
+          git submodule update --progress --init lib/windows_x64
+          Remove-Item Env:\GIT_LFS_SKIP_SMUDGE
+          Push-Location lib/windows_x64
+          git lfs pull
+          Pop-Location
+
+      - name: Checkout assets
+        shell: pwsh
+        run: git submodule update --progress --init release/datafiles/assets
+
+      - name: Detect Visual Studio
+        id: detect-vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInfo = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
+          if (-not $vsInfo) { throw "Visual Studio not found" }
+          $installPath = $vsInfo[0].installationPath
+          $version = $vsInfo[0].installationVersion
+          $majorMinor = $version.Split('.')[0..1] -join '.'
+          Write-Host "Found VS at: $installPath (version $version)"
+
+          # Determine generator
+          if ($version.StartsWith("17")) {
+            echo "generator=Visual Studio 17 2022" >> $env:GITHUB_OUTPUT
+          } elseif ($version.StartsWith("16")) {
+            echo "generator=Visual Studio 16 2019" >> $env:GITHUB_OUTPUT
+          } else {
+            throw "Unsupported Visual Studio version: $version"
+          }
+          echo "path=$installPath" >> $env:GITHUB_OUTPUT
+
+      - name: Find OptiX SDK
+        id: find-optix
+        shell: pwsh
+        run: |
+          # Search standard NVIDIA OptiX install locations
+          $searchPaths = @(
+            "$env:ProgramData\NVIDIA Corporation\OptiX SDK 8*",
+            "$env:ProgramData\NVIDIA Corporation\OptiX SDK 7*"
+          )
+          $optixDir = $null
+          foreach ($pattern in $searchPaths) {
+            $found = Get-Item -Path $pattern -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+            if ($found) { $optixDir = $found.FullName; break }
+          }
+          if ($optixDir) {
+            Write-Host "Found OptiX at: $optixDir"
+            echo "optix_root=$optixDir" >> $env:GITHUB_OUTPUT
+            echo "found=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "::warning::OptiX SDK not found — OptiX kernel compilation will be skipped"
+            echo "found=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          cmake ^
+            -G "${{ steps.detect-vs.outputs.generator }}" -A x64 ^
+            -S "${{ github.workspace }}" ^
+            -B "%BUILD_DIR%" ^
+            -C "${{ github.workspace }}\build_files\cmake\config\blender_release.cmake" ^
+            -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
+            -DWITH_CYCLES=ON ^
+            -DWITH_CYCLES_DEVICE_CUDA=ON ^
+            -DWITH_CYCLES_DEVICE_OPTIX=ON ^
+            -DWITH_CYCLES_CUDA_BINARIES=ON ^
+            -DWITH_CUDA_DYNLOAD=ON ^
+            ${{ steps.find-optix.outputs.found == 'true' && format('-DOPTIX_ROOT_DIR="{0}"', steps.find-optix.outputs.optix_root) || '' }}
+          if errorlevel 1 exit /b 1
+
+      - name: Build
+        shell: cmd
+        run: |
+          cmake --build "%BUILD_DIR%" --config %BUILD_TYPE% --parallel -- /maxcpucount
+          if errorlevel 1 exit /b 1
+
+      - name: Install
+        shell: cmd
+        run: |
+          cmake --build "%BUILD_DIR%" --config %BUILD_TYPE% --target INSTALL
+          if errorlevel 1 exit /b 1
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: goo-engine-windows-x64
+          path: ${{ github.workspace }}\build\bin\
+          retention-days: 14
+          if-no-files-found: error
