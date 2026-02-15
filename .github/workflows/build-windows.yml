@@ -20,7 +20,6 @@ jobs:
       BUILD_TYPE: Release
       CUDA_VERSION: "12.8.1"
       CUDA_VERSION_SHORT: "12.8"
-      OPTIX_VERSION: "8.1.0"
 
     steps:
       - name: Clean workspace
@@ -75,38 +74,24 @@ jobs:
         id: install-optix
         shell: pwsh
         run: |
-          $optixDir = "C:\optix\NVIDIA-OptiX-SDK-${{ env.OPTIX_VERSION }}"
+          $optixDir = "C:\optix\optix-dev"
           if (Test-Path "$optixDir\include\optix.h") {
-            Write-Host "OptiX ${{ env.OPTIX_VERSION }} already installed at $optixDir"
+            Write-Host "OptiX headers already present at $optixDir"
+            Push-Location $optixDir
+            git pull --quiet origin main 2>$null
+            Pop-Location
           } else {
-            Write-Host "Downloading OptiX SDK ${{ env.OPTIX_VERSION }} headers..."
-            # OptiX SDK requires NVIDIA developer login for full download.
-            # As a workaround, we fetch the open-source headers from the official GitHub repo.
-            New-Item -ItemType Directory -Force -Path "$optixDir\include" | Out-Null
-            $baseUrl = "https://raw.githubusercontent.com/NVIDIA/optix-dev/v${{ env.OPTIX_VERSION }}/include"
-            $headers = @(
-              "optix.h", "optix_device.h", "optix_function_table.h",
-              "optix_function_table_definition.h", "optix_host.h",
-              "optix_stack_size.h", "optix_stubs.h", "optix_types.h",
-              "optix_7_device.h", "optix_7_host.h", "optix_7_types.h",
-              "optix_device_impl.h", "optix_device_impl_exception.h",
-              "optix_device_impl_transformations.h"
-            )
-            foreach ($h in $headers) {
-              $url = "$baseUrl/$h"
-              $dest = "$optixDir\include\$h"
-              try {
-                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -ErrorAction Stop
-                Write-Host "  Downloaded $h"
-              } catch {
-                Write-Host "  Skipped $h (not in this version)"
-              }
-            }
-            if (-not (Test-Path "$optixDir\include\optix.h")) {
-              throw "Failed to download OptiX headers"
-            }
-            Write-Host "OptiX headers installed successfully"
+            Write-Host "Cloning OptiX headers from NVIDIA/optix-dev..."
+            git clone --depth 1 https://github.com/NVIDIA/optix-dev.git $optixDir
           }
+          if (-not (Test-Path "$optixDir\include\optix.h")) {
+            throw "OptiX headers not found after clone"
+          }
+          # Verify internal headers exist (required for kernel compilation)
+          if (-not (Test-Path "$optixDir\include\internal\optix_device_impl.h")) {
+            throw "OptiX internal headers missing"
+          }
+          Write-Host "OptiX headers ready (include/ and include/internal/)"
           echo "optix_root=$optixDir" >> $env:GITHUB_OUTPUT
 
       - name: Detect Visual Studio
@@ -114,47 +99,40 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsInfo = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
-          if (-not $vsInfo) { throw "Visual Studio not found" }
-          $installPath = $vsInfo[0].installationPath
-          $version = $vsInfo[0].installationVersion
-          Write-Host "Found VS at: $installPath (version $version)"
-          if ($version.StartsWith("17")) {
-            echo "generator=Visual Studio 17 2022" >> $env:GITHUB_OUTPUT
-          } elseif ($version.StartsWith("16")) {
-            echo "generator=Visual Studio 16 2019" >> $env:GITHUB_OUTPUT
-          } else {
-            throw "Unsupported Visual Studio version: $version"
-          }
-          echo "path=$installPath" >> $env:GITHUB_OUTPUT
+          $vsPath = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio not found" }
+          Write-Host "Found VS at: $vsPath"
+          # Verify Ninja is available
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw "Ninja not found in PATH" }
 
       - name: Configure CMake
         shell: cmd
         run: |
-          cmake ^
-            -G "${{ steps.detect-vs.outputs.generator }}" -A x64 ^
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" amd64
+          cmake -G Ninja ^
             -S "${{ github.workspace }}" ^
             -B "%BUILD_DIR%" ^
             -C "${{ github.workspace }}\build_files\cmake\config\blender_release.cmake" ^
             -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=cl ^
             -DWITH_CYCLES=ON ^
             -DWITH_CYCLES_DEVICE_CUDA=ON ^
             -DWITH_CYCLES_DEVICE_OPTIX=ON ^
             -DWITH_CYCLES_CUDA_BINARIES=ON ^
             -DWITH_CUDA_DYNLOAD=ON ^
+            -DCYCLES_CUDA_BINARIES_ARCH="sm_52;sm_60;sm_61;sm_70;sm_75;sm_86;sm_89;sm_120;compute_75" ^
             -DOPTIX_ROOT_DIR="${{ steps.install-optix.outputs.optix_root }}"
           if errorlevel 1 exit /b 1
 
       - name: Build
         shell: cmd
         run: |
-          cmake --build "%BUILD_DIR%" --config %BUILD_TYPE% --parallel -- /maxcpucount
-          if errorlevel 1 exit /b 1
-
-      - name: Install
-        shell: cmd
-        run: |
-          cmake --build "%BUILD_DIR%" --config %BUILD_TYPE% --target INSTALL
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" amd64
+          ninja -C "%BUILD_DIR%" -j 96 install
           if errorlevel 1 exit /b 1
 
       - name: Upload build artifact
