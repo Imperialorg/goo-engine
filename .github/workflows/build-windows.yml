@@ -35,7 +35,13 @@ jobs:
         with:
           submodules: false
           clean: true
-          lfs: true
+          lfs: false
+
+      - name: Pull LFS files (release data only)
+        shell: pwsh
+        run: |
+          git lfs install --local
+          git lfs pull --include="release/datafiles/**,release/windows/**,scripts/startup/**"
 
       - name: Cache lib/windows_x64 (LFS)
         id: cache-libs
