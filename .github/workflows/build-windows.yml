@@ -20,6 +20,7 @@ jobs:
       BUILD_TYPE: Release
       CUDA_VERSION: "12.8.1"
       CUDA_VERSION_SHORT: "12.8"
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - name: Clean workspace
@@ -35,7 +36,17 @@ jobs:
           submodules: false
           clean: true
 
+      - name: Cache lib/windows_x64 (LFS)
+        id: cache-libs
+        uses: actions/cache@v4
+        with:
+          path: lib/windows_x64
+          key: win-libs-${{ hashFiles('.gitmodules') }}-${{ hashFiles('build_files/build_environment/cmake/versions.cmake') }}
+          restore-keys: |
+            win-libs-
+
       - name: Checkout Windows x64 libraries (with LFS)
+        if: steps.cache-libs.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           git config --local submodule.lib/windows_x64.update checkout
@@ -50,48 +61,74 @@ jobs:
         shell: pwsh
         run: git submodule update --progress --init release/datafiles/assets
 
+      - name: Cache CUDA Toolkit installer
+        id: cache-cuda-installer
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\cuda_installer.exe
+          key: cuda-installer-${{ env.CUDA_VERSION }}
+
+      - name: Cache build directory (Ninja incremental)
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\build
+          key: win-build-${{ github.sha }}
+          restore-keys: |
+            win-build-
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install CUDA Toolkit
         id: install-cuda
         shell: pwsh
         run: |
           $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_SHORT }}"
-          if (Test-Path "$cudaPath\bin\nvcc.exe") {
-            Write-Host "CUDA ${{ env.CUDA_VERSION_SHORT }} already installed at $cudaPath"
-          } else {
-            Write-Host "Downloading CUDA Toolkit ${{ env.CUDA_VERSION }}..."
+          Write-Host "Installing CUDA Toolkit ${{ env.CUDA_VERSION }}..."
+          $installerPath = "${{ runner.temp }}\cuda_installer.exe"
+          if (-not (Test-Path $installerPath)) {
+            Write-Host "Downloading CUDA installer..."
             $installerUrl = "https://developer.download.nvidia.com/compute/cuda/${{ env.CUDA_VERSION }}/network_installers/cuda_${{ env.CUDA_VERSION }}_windows_network.exe"
-            $installerPath = "${{ runner.temp }}\cuda_installer.exe"
             Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
-            Write-Host "Installing CUDA Toolkit (silent)..."
-            $proc = Start-Process -FilePath $installerPath -ArgumentList "-s", "nvcc_${{ env.CUDA_VERSION_SHORT }}", "cudart_${{ env.CUDA_VERSION_SHORT }}", "visual_studio_integration_${{ env.CUDA_VERSION_SHORT }}" -Wait -PassThru -NoNewWindow
-            if ($proc.ExitCode -ne 0) { throw "CUDA install failed with exit code $($proc.ExitCode)" }
-            Write-Host "CUDA Toolkit installed successfully"
+          } else {
+            Write-Host "Using cached CUDA installer"
           }
+          Write-Host "Running CUDA installer (silent)..."
+          $proc = Start-Process -FilePath $installerPath -ArgumentList "-s", "nvcc_${{ env.CUDA_VERSION_SHORT }}", "cudart_${{ env.CUDA_VERSION_SHORT }}", "visual_studio_integration_${{ env.CUDA_VERSION_SHORT }}" -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "CUDA install failed with exit code $($proc.ExitCode)" }
+          Write-Host "CUDA Toolkit installed successfully"
           echo "cuda_path=$cudaPath" >> $env:GITHUB_OUTPUT
           echo "$cudaPath\bin" >> $env:GITHUB_PATH
+
+      - name: Cache OptiX SDK headers
+        id: cache-optix
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\optix-dev
+          key: optix-headers-v8.1.0
 
       - name: Install OptiX SDK (headers only)
         id: install-optix
         shell: pwsh
         run: |
-          $optixDir = "C:\optix\optix-dev"
+          $optixDir = "${{ github.workspace }}\optix-dev"
           if (Test-Path "$optixDir\include\optix.h") {
-            Write-Host "OptiX headers already present at $optixDir"
-            Push-Location $optixDir
-            git pull --quiet origin main 2>$null
-            Pop-Location
+            Write-Host "OptiX headers restored from cache"
           } else {
-            Write-Host "Cloning OptiX headers from NVIDIA/optix-dev..."
-            git clone --depth 1 https://github.com/NVIDIA/optix-dev.git $optixDir
+            Write-Host "Cloning OptiX 8.1.0 headers..."
+            git clone https://github.com/NVIDIA/optix-dev.git $optixDir
+            Push-Location $optixDir
+            git checkout 50021ea0af6d41609a97777ceebbdf1e1d34efe7
+            Pop-Location
           }
           if (-not (Test-Path "$optixDir\include\optix.h")) {
             throw "OptiX headers not found after clone"
           }
-          # Verify internal headers exist (required for kernel compilation)
           if (-not (Test-Path "$optixDir\include\internal\optix_device_impl.h")) {
             throw "OptiX internal headers missing"
           }
-          Write-Host "OptiX headers ready (include/ and include/internal/)"
+          Write-Host "OptiX 8.1.0 headers ready"
           echo "optix_root=$optixDir" >> $env:GITHUB_OUTPUT
 
       - name: Detect Visual Studio
@@ -118,6 +155,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
             -DCMAKE_C_COMPILER=cl ^
             -DCMAKE_CXX_COMPILER=cl ^
+            -DWITH_WINDOWS_SCCACHE=ON ^
             -DWITH_CYCLES=ON ^
             -DWITH_CYCLES_DEVICE_CUDA=ON ^
             -DWITH_CYCLES_DEVICE_OPTIX=ON ^
@@ -134,6 +172,10 @@ jobs:
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" amd64
           ninja -C "%BUILD_DIR%" -j 96 install
           if errorlevel 1 exit /b 1
+
+      - name: Show sccache stats
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
