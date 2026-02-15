@@ -37,13 +37,29 @@ jobs:
           clean: true
           lfs: false
 
-      - name: Pull LFS files (release data only)
+      - name: Pull all LFS files
         shell: pwsh
         run: |
           git lfs install --local
-          # Override LFS endpoint to fetch from upstream Blender (avoids GitHub LFS budget)
+          # Fetch LFS objects from upstream Blender (repo was detached from fork network,
+          # so GitHub LFS storage is empty - Blender's Gitea has 5663/5664 objects)
           git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          git lfs pull --include="release/datafiles/**,scripts/startup/**"
+          git lfs pull
+          # splash.png is goo-engine-specific (not in Blender upstream), use Blender's default
+          git config lfs.url https://github.com/Imperialorg/goo-engine.git/info/lfs
+          # Generate a placeholder splash if the LFS object is missing
+          $splashFile = "release/datafiles/splash.png"
+          $content = Get-Content $splashFile -Raw -ErrorAction SilentlyContinue
+          if ($content -match "^version https://git-lfs") {
+            Write-Host "splash.png is still an LFS pointer - creating 1x1 placeholder PNG"
+            # Minimal valid PNG (1x1 transparent pixel)
+            $pngBytes = [byte[]]@(0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+              0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,
+              0x89,0x00,0x00,0x00,0x0A,0x49,0x44,0x41,0x54,0x78,0x9C,0x62,0x00,0x00,0x00,0x02,
+              0x00,0x01,0xE5,0x27,0xDE,0xFC,0x00,0x00,0x00,0x00,0x49,0x45,0x4E,0x44,0xAE,0x42,
+              0x60,0x82)
+            [System.IO.File]::WriteAllBytes((Resolve-Path $splashFile), $pngBytes)
+          }
 
       - name: Cache lib/windows_x64 (LFS)
         id: cache-libs
