@@ -41,7 +41,9 @@ jobs:
         shell: pwsh
         run: |
           git lfs install --local
-          git lfs pull --include="release/datafiles/**,release/windows/**,scripts/startup/**"
+          # Override LFS endpoint to fetch from upstream Blender (avoids GitHub LFS budget)
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git lfs pull --include="release/datafiles/**,scripts/startup/**"
 
       - name: Cache lib/windows_x64 (LFS)
         id: cache-libs
