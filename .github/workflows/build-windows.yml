@@ -86,12 +86,12 @@ jobs:
         shell: pwsh
         run: git submodule update --progress --init release/datafiles/assets
 
-      - name: Cache CUDA Toolkit installer
-        id: cache-cuda-installer
+      - name: Cache CUDA Toolkit installation
+        id: cache-cuda
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}\cuda_installer.exe
-          key: cuda-installer-${{ env.CUDA_VERSION }}
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_SHORT }}
+          key: cuda-installed-${{ env.CUDA_VERSION }}
 
       - name: Cache build directory (Ninja incremental)
         id: cache-build
@@ -106,23 +106,24 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install CUDA Toolkit
+        if: steps.cache-cuda.outputs.cache-hit != 'true'
         id: install-cuda
         shell: pwsh
         run: |
           $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_SHORT }}"
           Write-Host "Installing CUDA Toolkit ${{ env.CUDA_VERSION }}..."
+          $installerUrl = "https://developer.download.nvidia.com/compute/cuda/${{ env.CUDA_VERSION }}/network_installers/cuda_${{ env.CUDA_VERSION }}_windows_network.exe"
           $installerPath = "${{ runner.temp }}\cuda_installer.exe"
-          if (-not (Test-Path $installerPath)) {
-            Write-Host "Downloading CUDA installer..."
-            $installerUrl = "https://developer.download.nvidia.com/compute/cuda/${{ env.CUDA_VERSION }}/network_installers/cuda_${{ env.CUDA_VERSION }}_windows_network.exe"
-            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
-          } else {
-            Write-Host "Using cached CUDA installer"
-          }
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
           Write-Host "Running CUDA installer (silent)..."
           $proc = Start-Process -FilePath $installerPath -ArgumentList "-s", "nvcc_${{ env.CUDA_VERSION_SHORT }}", "cudart_${{ env.CUDA_VERSION_SHORT }}", "visual_studio_integration_${{ env.CUDA_VERSION_SHORT }}" -Wait -PassThru -NoNewWindow
           if ($proc.ExitCode -ne 0) { throw "CUDA install failed with exit code $($proc.ExitCode)" }
           Write-Host "CUDA Toolkit installed successfully"
+
+      - name: Set CUDA environment
+        shell: pwsh
+        run: |
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_SHORT }}"
           echo "cuda_path=$cudaPath" >> $env:GITHUB_OUTPUT
           echo "$cudaPath\bin" >> $env:GITHUB_PATH
 
